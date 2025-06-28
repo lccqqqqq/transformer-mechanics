@@ -1,0 +1,12 @@
+out/
+data/
+plots/
+*.pth
+*.pkl
+*.pt
+
+# packages
+__pycache__/
+
+# execution scripts c.f. Hydra
+*.sh
