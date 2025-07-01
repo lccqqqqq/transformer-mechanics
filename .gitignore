@@ -4,7 +4,7 @@ plots/
 *.pth
 *.pkl
 *.pt
-
+*.out
 # packages
 __pycache__/
 
