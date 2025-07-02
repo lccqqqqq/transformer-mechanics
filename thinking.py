@@ -10,6 +10,8 @@ from torch import Tensor
 from jaxtyping import Int
 from typing import Callable
 import json
+from itertools import product
+from tqdm import tqdm
 
 model_name = "gpt2-small"
 device = "cuda"
@@ -205,6 +207,60 @@ def main(
     }
     t.save(results, f"{save_dir}/results_{model_name}_{prompt_label}_top{k}.pt")
     
+
+def topk_decoder(
+    model_name: str,
+    layer_list: list[int],
+    device: str,
+    prompt: str,
+    k: int = 3,
+    save_dir: str = "data/thinking"
+):
+    """
+    Decode the residue stream using the top-k probabilities.
+    
+    This function takes the probability distributions from all layers and
+    decodes the residue stream using the top-k probabilities.
+    """
+    model, tokenizer = load_model_and_tokenizer(model_name, device=device)
+    probs_all_layers = get_probs_all_layers(model_name, device, prompt)
+    values, indices = t.topk(probs_all_layers[layer_list], k=k, dim=-1)
+    # shapes of values: [len(layer_list), seq_len, k]
+    
+    str_array = [[
+        ["" for _ in range(k)]
+        for _ in range(len(layer_list))
+    ] for _ in range(probs_all_layers.shape[1])]
+    # the dimensions are [seq_len, len(layer_list), k]
+    
+    # get in the topk tokens
+    for layer_idx, seq_pos, k_idx in tqdm(
+        product(range(len(layer_list)), range(probs_all_layers.shape[1]), range(k)),
+        total=len(layer_list) * probs_all_layers.shape[1] * k,
+        desc="Decoding tokens"
+    ):
+        token_id = indices[layer_idx, seq_pos, k_idx].item()
+        token_string = tokenizer.decode([token_id])
+        token_string = token_string.replace(" ", "_")
+        str_array[seq_pos][layer_idx][k_idx] = token_string
+        
+    # Save numeric data with torch.save
+    numeric_data = {
+        "values": values,
+        "indices": indices,
+    }
+    t.save(numeric_data, f"{save_dir}/topk_decoder_{model_name}_top{k}.pt")
+    
+    # Save string data with JSON
+    with open(f"{save_dir}/topk_decoder_{model_name}_top{k}_strings.json", "w") as f:
+        json.dump(str_array, f, indent=2)
+    
+    return str_array, values, indices
+
+# ===============================================
+# Legacy functions
+# ===============================================
+    
 def context_dependent_weight(seq_len: int, position: Int[Tensor, ""], beta: float = 1.0):
     """
     Calculate context-dependent weights for sequence positions.
@@ -359,10 +415,25 @@ def compare_closeness_to_tokens_without_pos_emb(
     
 
 if __name__ == "__main__":
-    main(model_name="gpt2-xl", prompt_label="gpt2xl-random", k=5)
+    # main(model_name="gpt2-xl", prompt_label="gpt2xl-random", k=5)
     # debug()
     # compare_closeness_to_tokens_without_pos_emb(model_name="gpt2-xl", prompt_label="gpt4o-normal", metric=top_k_metric)
-
+    import numpy as np
+    prompts = json.load(open("simple_prompt_list.json", "r"))
+    prompt = prompts[-1]
+    str_array, values, indices = topk_decoder(
+        model_name="gpt2-xl",
+        layer_list=list(np.linspace(0, 47, 6, dtype=int)),
+        device="cuda",
+        prompt=prompt,
+        k=3,
+        save_dir="data/thinking"
+    )
+    print(str_array[0])
+    print('--------------------------------')
+    print(values)
+    print('--------------------------------')
+    print(indices)
 
     
 
