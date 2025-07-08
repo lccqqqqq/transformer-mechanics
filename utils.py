@@ -8,6 +8,7 @@ import inspect
 import re
 from collections import defaultdict
 import sys
+import psutil
 
 
 
@@ -43,7 +44,8 @@ def load_model_and_tokenizer(model_name: str, device: str = "cuda", torch_dtype:
     model_id = MODEL_LIST[model_name]
     if format == 'nns':
         try:
-            model = LanguageModel(model_id, device_map=device, torch_dtype=torch_dtype)
+            model = LanguageModel(model_id, device_map=device, torch_dtype=torch_dtype, dispatch=True)
+            print(f"Model {model_name} loaded using nnsight")
         except Exception as e:
             print(f"Error loading model {model_name} using nnsight: {e}")
             print("Switching to default hf format")
@@ -211,7 +213,7 @@ class MemoryMonitor:
             name: Name of the monitor (default: "Memory Monitor")
         """
         self.name = name
-        self.measurements = []
+        self.measurements = []  # Will store (time, memory, label) tuples
         self.start_time = None
         self.start_memory = None
         
@@ -220,15 +222,16 @@ class MemoryMonitor:
         import time
         self.start_time = time.time()
         self.start_memory = t.cuda.memory_allocated() / (1024 * 1024 * 1024)  # GB
-        self.measurements.append((0, self.start_memory))
+        self.measurements.append((0, self.start_memory, "Start"))
         print(f"{self.name}: Started monitoring at {self.start_memory:.2f} GB")
         
-    def measure(self, label=None):
+    def measure(self, label=None, print_msg=False):
         """
         Take a measurement of current memory usage.
         
         Args:
             label: Label for this measurement (default: None)
+            print_msg: Whether to print the measurement message (default: False)
         """
         if self.start_time is None:
             print(f"{self.name}: Monitoring not started. Call start() first.")
@@ -239,12 +242,14 @@ class MemoryMonitor:
         current_memory = t.cuda.memory_allocated() / (1024 * 1024 * 1024)  # GB
         memory_change = current_memory - self.start_memory
         
-        self.measurements.append((current_time, current_memory))
+        # Use the label or create a default one
+        if label is None:
+            label = f"Measurement {len(self.measurements)}"
         
-        if label:
+        self.measurements.append((current_time, current_memory, label))
+        
+        if print_msg:
             print(f"{self.name}: [{label}] Time: {current_time:.2f}s, Memory: {current_memory:.2f} GB, Change: {memory_change:+.2f} GB")
-        else:
-            print(f"{self.name}: Time: {current_time:.2f}s, Memory: {current_memory:.2f} GB, Change: {memory_change:+.2f} GB")
     
     def plot(self):
         """Plot memory usage over time."""
@@ -254,7 +259,7 @@ class MemoryMonitor:
             print(f"{self.name}: No measurements to plot.")
             return
         
-        times, memories = zip(*self.measurements)
+        times, memories, labels = zip(*self.measurements)
         
         plt.figure(figsize=(10, 6))
         plt.plot(times, memories, 'b-', marker='o')
@@ -301,6 +306,80 @@ class MemoryMonitor:
         if hasattr(self, 'monitor_thread'):
             self.monitor_thread.join()
             print(f"{self.name}: Stopped continuous monitoring")
+    
+    def report(self, return_history=False):
+        """
+        Generate a simple memory report showing measure statements and memory used.
+        
+        Args:
+            return_history: Whether to return measurement history (default: False)
+        
+        Returns:
+            If return_history=True: dict with measurement history and memory increase info
+            Otherwise: None (prints formatted table to console)
+        """
+        try:
+            from rich.console import Console
+            from rich.table import Table
+            from rich import box
+            console = Console()
+        except ImportError:
+            print("Rich package not installed. Install with: pip install rich")
+            if return_history:
+                return None
+            return
+        
+        # Create simple table
+        table = Table(title=f"{self.name} - Memory Report", box=box.ROUNDED)
+        table.add_column("Measure Statement")
+        table.add_column("Memory Used (GB)")
+        
+        # Prepare measurement history for return
+        history_data = []
+        
+        # Add measurement history
+        if self.measurements:
+            for i, (time_elapsed, memory_used, label) in enumerate(self.measurements):
+                if label == "Start":
+                    measure_statement = f"Start ({time_elapsed:.1f}s)"
+                    memory_increase = 0.0  # Start measurement has no increase
+                else:
+                    measure_statement = f"{label} ({time_elapsed:.1f}s)"
+                    # Calculate memory increase since last measurement
+                    if i > 0:
+                        memory_increase = memory_used - self.measurements[i-1][1]
+                    else:
+                        memory_increase = memory_used - self.start_memory
+                
+                table.add_row(measure_statement, f"{memory_used:.2f}")
+                
+                if return_history:
+                    history_data.append({
+                        'time': time_elapsed,
+                        'description': label,
+                        'memory_used_gb': memory_used,
+                        'memory_increase_gb': memory_increase
+                    })
+        
+        # Current GPU memory
+        if t.cuda.is_available():
+            gpu_memory_allocated = t.cuda.memory_allocated() / 1024**3  # GB
+            table.add_row("Current GPU Memory", f"{gpu_memory_allocated:.2f}")
+        
+        # Current CPU memory
+        cpu_memory_used = psutil.virtual_memory().used / 1024**3  # GB
+        table.add_row("Current CPU Memory", f"{cpu_memory_used:.2f}")
+        
+        # Print the table
+        console.print(table)
+        
+        # Return history if requested
+        if return_history:
+            return {
+                'measurements': history_data,
+                'current_gpu_memory_gb': gpu_memory_allocated if t.cuda.is_available() else None,
+                'current_cpu_memory_gb': cpu_memory_used
+            }
 
 def clear_memory(variables_to_keep=None, clear_tensors=True, clear_cache=True):
     """
@@ -326,6 +405,7 @@ def clear_memory(variables_to_keep=None, clear_tensors=True, clear_cache=True):
     # Clear PyTorch cache
     if clear_cache and 't' in current_vars:
         t.cuda.empty_cache()
+        t.cuda.reset_peak_memory_stats()
     
     # Run garbage collection
     gc.collect()
@@ -342,7 +422,7 @@ def clear_memory(variables_to_keep=None, clear_tensors=True, clear_cache=True):
     
     # Print memory usage after clearing
     print_gpu_memory("after clearing memory")
-    
+    gc.collect()
     return None
 
 def print_memory_usage():
