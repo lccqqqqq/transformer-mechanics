@@ -10,7 +10,9 @@ from collections import defaultdict
 import sys
 import psutil
 
-
+from typing import Callable
+from jaxtyping import Float
+from torch import Tensor
 
 # ----- Loading models -----
 
@@ -458,4 +460,41 @@ def print_memory_usage():
     for type_name, total_mb in memory_by_type.items():
         print(f"{type_name:<20}: {total_mb:.2f} MB")
 
+
+# ----- steering utilities -----
+
+def random_steering(
+    target_vector: Float[Tensor, "... d_model"],
+    original_vector: Float[Tensor, "... d_model"],
+    steering_strength: float = 0.1,
+):
+    random_vector = t.randn_like(original_vector)
+    # Compute norms along the d_model dimension only
+    random_norm = t.norm(random_vector, dim=-1, keepdim=True)
+    original_norm = t.norm(original_vector, dim=-1, keepdim=True)
+    
+    # Scale random vectors to match original magnitudes per position
+    random_vector = random_vector / random_norm * original_norm
+    
+    new_vector = original_vector + steering_strength * (random_vector - original_vector)
+    return new_vector
+
+
+def interpolation_steering(
+    target_vector: Float[Tensor, "... d_model"],
+    original_vector: Float[Tensor, "... d_model"],
+    steering_strength: float = 0.1,
+):
+    """
+    Note:
+        This method provides more controlled steering compared to direct_steering
+        because the result is always a convex combination of the input vectors
+        when steering_strength ≤ 1. This prevents the output from having
+        unexpectedly large magnitudes.
+    """
+    if steering_strength > 1:
+        raise ValueError("Steering strength must be less than 1")
+    
+    new_vector = original_vector + steering_strength * (target_vector - original_vector)
+    return new_vector
     

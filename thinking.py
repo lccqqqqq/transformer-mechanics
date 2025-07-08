@@ -214,6 +214,7 @@ def topk_decoder(
     device: str,
     prompt: str,
     k: int = 3,
+    save_data: bool = True,
     save_dir: str = "data/thinking"
 ):
     """
@@ -423,7 +424,7 @@ if __name__ == "__main__":
     prompt = prompts[-1]
     str_array, values, indices = topk_decoder(
         model_name="gpt2-xl",
-        layer_list=list(np.linspace(0, 47, 6, dtype=int)),
+        layer_list=[0, 10, 21, 30, 40, 48],
         device="cuda",
         prompt=prompt,
         k=3,

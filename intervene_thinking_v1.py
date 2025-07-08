@@ -3,7 +3,7 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import torch as t
 from nnsight import LanguageModel, util
-from utils import load_model_and_tokenizer, print_shape, print_gpu_memory, MemoryMonitor, clear_memory
+from utils import load_model_and_tokenizer, print_shape, print_gpu_memory, MemoryMonitor, clear_memory, interpolation_steering, random_steering
 from jaxtyping import Float
 from torch import Tensor
 from jaxtyping import Int
@@ -17,49 +17,21 @@ import numpy as np
 import gc
 from nnsight.tracing.graph import Proxy
 
-
-def random_steering(
-    target_vector: Float[Tensor, "... d_model"],
-    original_vector: Float[Tensor, "... d_model"],
-    steering_strength: float = 0.1,
-):
-    """
-    Note:
-        - This method steers the original vector towards a random direction.
-        - The random vector is chosen to have the same norm as the original vector.
-    """
-    random_vector = t.randn_like(original_vector)
-    new_vector = original_vector + steering_strength * (random_vector / t.norm(random_vector) * t.norm(original_vector) - original_vector)
-    return new_vector
+from thinking import topk_decoder
+from debug_thinking_interventions import get_probs_all_layers_with_intervention
 
 
-def interpolation_steering(
-    target_vector: Float[Tensor, "... d_model"],
-    original_vector: Float[Tensor, "... d_model"],
-    steering_strength: float = 0.1,
-):
-    """
-    Note:
-        This method provides more controlled steering compared to direct_steering
-        because the result is always a convex combination of the input vectors
-        when steering_strength ≤ 1. This prevents the output from having
-        unexpectedly large magnitudes.
-    """
-    if steering_strength > 1:
-        raise ValueError("Steering strength must be less than 1")
-    
-    new_vector = original_vector + steering_strength * (target_vector - original_vector)
-    return new_vector
+
 
 def run_steering_one_batch(
     model: LanguageModel,
     tokenizer: AutoTokenizer,
     input_ids: Int[Tensor, "batch_size max_length"],
     steering_strength: float = 0.1,
-    steering_method: Callable = None,
+    steering_method: Callable | None = None,
     layer_batch_size: int = 4,
     monitor: MemoryMonitor = None,
-):
+) -> Float[Tensor, "batch_size layer ctx vocab"]:
     model.eval()
     decoder = model.lm_head.weight.data
     
@@ -79,13 +51,13 @@ def run_steering_one_batch(
     if monitor is not None:
         monitor.measure("Original output")
     
-    layer_batches = list(range(0, 48, layer_batch_size))  # 48 layers (0-47) batched by batch_size
+    layer_batches = list(range(0, model.config.n_layer, layer_batch_size))  # 48 layers (0-47) batched by batch_size
     for i, layer_batch in enumerate(layer_batches):
         batch_output = []
         with t.no_grad():
             with model.trace() as tracer:
                 # Then, run interventions for each layer
-                for layer_idx, layer in enumerate(model.transformer.h[layer_batch:min(layer_batch+layer_batch_size, 47)]):
+                for layer_idx, layer in enumerate(model.transformer.h[layer_batch:min(layer_batch+layer_batch_size, model.config.n_layer)]):
                     with tracer.invoke(input_ids) as invoker:
                         layer_output = model.lm_head(model.transformer.ln_f(layer.output[0]))
                         layer_output_tokens = t.argmax(layer_output, dim=-1)
@@ -93,9 +65,10 @@ def run_steering_one_batch(
                         
                         # apply the intervention to the hidden state
                         # Note: one must use the in place assignment
-                        hidden_state = layer.output[0]
-                        steered_state = steering_method(target_vectors, hidden_state, steering_strength)
-                        hidden_state[:] = steered_state
+                        if steering_method is not None:
+                            hidden_state = layer.output[0]
+                            steered_state = steering_method(target_vectors, hidden_state, steering_strength)
+                            hidden_state[:] = steered_state
                         
                         output = t.nn.functional.softmax(model.lm_head.output, dim=-1)
                         batch_output.append(output)
@@ -105,9 +78,82 @@ def run_steering_one_batch(
         
         output_list.append(batch_output)
         if monitor is not None:
-            monitor.measure(f"Batched process from {layer_batch} to {min(layer_batch+layer_batch_size, 47)}")
+            monitor.measure(f"Batched process from {layer_batch} to {min(layer_batch+layer_batch_size, model.config.n_layer-1)}")
 
     return t.cat(output_list, dim=1)
+
+
+
+def debug_run_steering_one_batch():
+    model_name = "gpt2-xl"
+    model, tokenizer = load_model_and_tokenizer(model_name, device="cuda", torch_dtype=t.bfloat16)
+    prompt = "One day, she was walking down the street when she was approached by a man who asked her out on a date."
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    
+    # set the test parameters
+    test_steering_layer = 39
+    test_steering_strength = 0.8
+    output = run_steering_one_batch(model, tokenizer, input_ids, steering_method=interpolation_steering, steering_strength=test_steering_strength)
+    
+    probs_all_layers = get_probs_all_layers_with_intervention(
+        model,
+        tokenizer,
+        prompt,
+        steering_method=interpolation_steering,
+        steering_strength=test_steering_strength,
+        steering_layer=test_steering_layer
+    )
+    
+    print("Test 1: The steered output from the function should be the same as the final layer output from the probs_all_layers object")
+    
+    try:
+        assert t.allclose(
+            output[0][test_steering_layer+1],
+            probs_all_layers[-1]
+        )
+        print("Test 1 passed")
+    except Exception as e:
+        print(e)
+        print(output[0][test_steering_layer+1])
+        print(probs_all_layers[-1])
+
+
+def process_one_batch(
+    model: LanguageModel,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    steering_method_list: List[Callable] = [interpolation_steering, random_steering],
+    steering_strength_list: List[float] = [0.1, 0.5, 0.8, 0.99],
+    binary: bool = True,
+    monitor: MemoryMonitor = None,
+    k: int = 3,
+    save_dir: str = None,
+    save_name_suffix: str = "",
+    save_data: bool = True,
+) -> Float[Tensor, "method strength layer_plus_1"]:
+    model.eval()
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    input_ids = input_ids.to(model.device)
+    
+    acc_metric = t.zeros(len(steering_method_list), len(steering_strength_list), model.config.n_layer + 1)
+    for method_idx, steering_method in enumerate(steering_method_list):
+        for strength_idx, steering_strength in enumerate(steering_strength_list):
+            output = run_steering_one_batch(
+                model,
+                tokenizer,
+                input_ids,
+                steering_method=steering_method,
+                steering_strength=steering_strength,
+                monitor=None
+            )
+            accuracy = accuracy_metric(input_ids, output, tokenizer, k=k, binary=binary)
+            acc_metric[method_idx, strength_idx] = accuracy
+            
+    if save_data:
+        if save_dir is not None:
+            t.save(acc_metric, os.path.join(save_dir, f"acc_metric{save_name_suffix}.pt"))
+            
+    return acc_metric
 
 
 def process_batches(model: LanguageModel, tokenizer: AutoTokenizer, prompts: List[str], batch_size: int = 24, max_length: int = 512, steering_method: Callable = None, steering_strength: float = 0.1, monitor: MemoryMonitor = None, n_total_prompts: int = 10000, k: int = 10, save_dir: str = None):
@@ -185,22 +231,18 @@ def accuracy_metric(
     intervention_output: Float[Tensor, "batch_size layer ctx vocab"],
     tokenizer: AutoTokenizer,
     k: int = 10,
+    binary: bool = True,
 ):
     ground_truth_tokens = input_ids[:, 1:].unsqueeze(1).unsqueeze(-1).to(intervention_output.device)
     values, indices = t.topk(intervention_output[:, :, :-1, :], k=k, dim=-1)
     # the shape: (batch_size, layer, ctx, k)
     matching_prob_within_topk = t.where(
         indices == ground_truth_tokens,
-        values,
+        values if not binary else t.ones_like(values),
         t.zeros_like(values),
     )
     matching_prob_within_topk = matching_prob_within_topk.sum(dim=-1).mean(dim=-1)
     return matching_prob_within_topk
-
-
-
-
-
         
 def memory_usage_sweeps():
     model_name = "gpt2-xl"
@@ -247,9 +289,6 @@ def memory_usage_sweeps():
         
     return memory_usage_history
 
-
-
-
 def main():
     monitor = MemoryMonitor()
     monitor.start()
@@ -283,6 +322,7 @@ def run_random_baseline_steering(trail_number: int = 5, n_total_prompts: int = 2
     ds = load_dataset("stas/openwebtext-10k")
     batch_size = 16
     max_length = 512
+    k = 3
     steering_method = random_steering
     save_dir = "data/thinking"
     steering_strength_list = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -310,17 +350,22 @@ def run_random_baseline_steering(trail_number: int = 5, n_total_prompts: int = 2
             steering_method=steering_method,
             steering_strength_list=steering_strength_list,
             n_total_prompts=n_total_prompts,
-            k=10,
+            k=k,
             save_dir=save_dir,
             save_name_suffix=f"_trail_{trail_idx}" if trail_idx > 1 else "_total",
         )
         
-
+def test_process_one_batch():
+    model_name = "gpt2-xl"
+    model, tokenizer = load_model_and_tokenizer(model_name, device="cuda", torch_dtype=t.bfloat16)
+    prompt = "One day, she was walking down the street when she was approached by a man who asked her out on a date."
+    process_one_batch(model, tokenizer, prompt, save_dir="data/thinking", save_name_suffix="_test", save_data=True, binary=True)
 
 if __name__ == "__main__":
     # n_total_prompts = 2000
     # model_name = "gpt2-xl"
     # model, tokenizer = load_model_and_tokenizer(model_name, device="cuda", torch_dtype=t.bfloat16)
+    # k = 3 # using top-3 accuracy and binary accuracy metric
     
     # ds = load_dataset("stas/openwebtext-10k")
     # ds = ds.shuffle(seed=42)
@@ -332,12 +377,16 @@ if __name__ == "__main__":
     # steering_method = interpolation_steering
     # save_dir = "data/thinking"
     
-    # intervention_output = sweep_steering_strength(model, tokenizer, prompts, batch_size=batch_size, max_length=max_length, steering_method=steering_method, steering_strength_list=steering_strength_list, n_total_prompts=n_total_prompts, k=10, save_dir=save_dir)
-    
+    # intervention_output = sweep_steering_strength(model, tokenizer, prompts, batch_size=batch_size, max_length=max_length, steering_method=steering_method, steering_strength_list=steering_strength_list, n_total_prompts=n_total_prompts, k=k, save_dir=save_dir)
+    # print(f"Finished interpolation steering sweeps, starting random baseline steering sweeps")
     # print(intervention_output.shape)
     # matching_prob_within_topk = process_batches(model, tokenizer, prompts, batch_size=batch_size, max_length=max_length, steering_method=interpolation_steering, n_total_prompts=n_total_prompts, k=10)
     # print(matching_prob_within_topk.shape)
-    run_random_baseline_steering(trail_number=1, n_total_prompts=10000)
+    # run_random_baseline_steering(trail_number=1, n_total_prompts=2000)
+    # print(f"Finished random baseline steering sweeps")
+    # debug_run_steering_one_batch()
+    test_process_one_batch()
+    
 
 
 
